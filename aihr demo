@@ -1,911 +1,275 @@
-"""
-========================================================================
-🤖 新东方考研顾问AI简历批量筛选系统 v2.0
-========================================================================
-功能特性：
-1. ✅ 自动扫描 resumes 文件夹
-2. ✅ 支持多种格式: txt, pdf, docx
-3. ✅ 专门针对考研顾问岗位定制评估模型
-4. ✅ 批量处理 + 智能排名 + 详细报告
-5. ✅ 可配置参数，易于扩展
-
-========================================================================
-"""
-
 import os
+import re
 import json
-import sys
-from datetime import datetime
-from pathlib import Path
+import time
+import requests
+import pdfplumber
+from typing import Dict, List, Any
 
-# 尝试导入第三方库
-try:
-    import PyPDF2
-    PDF_SUPPORT = True
-except ImportError:
-    PDF_SUPPORT = False
-    print("⚠️  提示: 如需处理PDF文件，请安装: pip install PyPDF2")
+# ============ 配置 ============
+BASE_DIR = os.path.dirname(__file__)
+RESUME_DIR = os.path.join(BASE_DIR, "resumes")
+OLLAMA_API = "http://127.0.0.1:11434/api/generate"   # 使用127.0.0.1避免localhost解析问题
+MODEL_NAME = "qwen3:8b"
+MAX_ITERATIONS = 5   # 最大循环次数，防止死循环
 
-try:
-    from docx import Document
-    DOCX_SUPPORT = True
-except ImportError:
-    DOCX_SUPPORT = False
-    print("⚠️  提示: 如需处理Word文件，请安装: pip install python-docx")
+# 确保文件夹存在
+if not os.path.exists(RESUME_DIR):
+    os.makedirs(RESUME_DIR)
 
-# ================ 第一部分：文本提取器 ================
-class TextExtractor:
-    """通用文本提取器"""
-    
-    @staticmethod
-    def extract(filepath):
-        """从文件提取文本"""
-        if not os.path.exists(filepath):
-            return ""
-        
-        ext = os.path.splitext(filepath)[1].lower()
-        
-        try:
-            if ext == '.txt':
-                return TextExtractor._extract_txt(filepath)
-            elif ext == '.pdf' and PDF_SUPPORT:
-                return TextExtractor._extract_pdf(filepath)
-            elif ext in ['.docx', '.doc'] and DOCX_SUPPORT:
-                return TextExtractor._extract_docx(filepath)
-            else:
-                print(f"  ⚠️  不支持的文件格式: {ext}")
-                return ""
-        except Exception as e:
-            print(f"  ❌ 提取失败: {str(e)[:50]}...")
-            return ""
-    
-    @staticmethod
-    def _extract_txt(filepath):
-        with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
-            return f.read()
-    
-    @staticmethod
-    def _extract_pdf(filepath):
-        text = ""
-        with open(filepath, 'rb') as f:
-            pdf = PyPDF2.PdfReader(f)
+# ============ 工具定义 ============
+# 每个工具是一个函数，并且有对应的 schema 描述
+
+TOOLS = [
+    {
+        "name": "list_resumes",
+        "description": "列出 resumes 文件夹中的所有 PDF 简历文件名称",
+        "parameters": {}   # 无参数
+    },
+    {
+        "name": "read_resume",
+        "description": "读取指定简历的文本内容（最多2000字符）",
+        "parameters": {
+            "filename": "简历文件名（必须包含 .pdf）"
+        }
+    },
+    {
+        "name": "evaluate_resume",
+        "description": "根据给定的岗位要求，评估一份简历并给出评分（0-100）和简短评语",
+        "parameters": {
+            "filename": "简历文件名",
+            "job_description": "岗位要求描述"
+        }
+    },
+    {
+        "name": "finish",
+        "description": "任务完成，返回最终答案给用户",
+        "parameters": {
+            "final_answer": "最终的总结性回复"
+        }
+    }
+]
+
+def tool_list_resumes() -> str:
+    files = [f for f in os.listdir(RESUME_DIR) if f.lower().endswith('.pdf')]
+    if not files:
+        return "📁 没有找到任何 PDF 简历。"
+    return "找到以下简历:\n" + "\n".join(f"  - {f}" for f in files)
+
+def tool_read_resume(filename: str) -> str:
+    path = os.path.join(RESUME_DIR, filename)
+    if not os.path.exists(path):
+        return f"❌ 文件 {filename} 不存在"
+    text = ""
+    try:
+        with pdfplumber.open(path) as pdf:
             for page in pdf.pages:
-                text += page.extract_text() + "\n"
-        return text
-    
-    @staticmethod
-    def _extract_docx(filepath):
-        doc = Document(filepath)
-        return "\n".join([para.text for para in doc.paragraphs])
+                txt = page.extract_text()
+                if txt:
+                    text += txt + "\n"
+                    if len(text) > 2000:
+                        break
+        return text.strip() if text else "⚠️ 未能提取到任何文本"
+    except Exception as e:
+        return f"❌ 读取失败: {e}"
 
-# ================ 第二部分：考研顾问专属评估模型 ================
-class EducationalConsultantEvaluator:
-    """
-    考研顾问AI评估模型
-    基于新东方考研顾问岗位JD定制
-    """
+def tool_evaluate_resume(filename: str, job_description: str) -> str:
+    # 先读取简历
+    resume_text = tool_read_resume(filename)
+    if resume_text.startswith("❌") or resume_text.startswith("⚠️"):
+        return resume_text
     
-    def __init__(self):
-        # 岗位JD（你的输入）
-        self.jd = {
-            "title": "考研顾问",
-            "salary": "25-40万",
-            "responsibilities": [
-                "向潜在学员介绍考研课程体系，提供个性化课程咨询与学习规划服务",
-                "根据学员基础（本科专业、目标院校、备考时间）设计适配的课程方案",
-                "协助开展高校市场推广活动，包括校园讲座、体验课等",
-                "冲刺月度、季度、年度销售目标，维护学员关系，完善学员数据库",
-                "建立客户信任，高效解决咨询过程中的疑问与顾虑，提升签单转化率",
-                "定期回访学员跟进学习进度，挖掘老学员转介绍潜力，推动客户裂变"
-            ],
-            "requirements": [
-                "硕士学历，有教育行业销售/咨询经验者优先考虑",
-                "具备较强销售意识，善于主动沟通，能精准洞察学员需求与心理",
-                "目标感强、抗压能力突出，有团队协作精神，热爱教育分享",
-                "认可新东方文化，愿意长期投身高等教育服务领域",
-                "具备良好的客户服务意识与同理心，善于建立信任关系",
-                "加分项：有考研经历｜熟悉教育产品销售｜具备较强的谈判技巧"
-            ]
-        }
-        
-        # 评估维度1：硬性条件（必须满足）
-        self.hard_requirements = {
-            "硕士学历": {
-                "keywords": ["硕士", "研究生", "研究生学历", "硕士学位", "master"],
-                "weight": 1.5,  # 最高权重
-                "mandatory": True
-            },
-            "销售意识": {
-                "keywords": ["销售", "业绩", "销售额", "转化", "签单", "kpi", "目标"],
-                "weight": 1.2,
-                "mandatory": True
-            },
-            "沟通能力": {
-                "keywords": ["沟通", "表达", "咨询", "讲解", "讲座", "演讲", "谈判"],
-                "weight": 1.0,
-                "mandatory": True
-            },
-            "教育行业经验": {
-                "keywords": ["教育", "培训", "教培", "k12", "考研", "新东方", "好未来", "学而思"],
-                "weight": 1.3,
-                "mandatory": True
-            }
-        }
-        
-        # 评估维度2：核心能力
-        self.core_competencies = {
-            "需求洞察": {
-                "keywords": ["需求分析", "客户心理", "痛点", "需求挖掘", "客户画像"],
-                "weight": 1.1
-            },
-            "方案设计": {
-                "keywords": ["方案设计", "学习规划", "课程方案", "个性化", "定制"],
-                "weight": 1.0
-            },
-            "客户关系": {
-                "keywords": ["客户关系", "学员维护", "回访", "跟进", "服务"],
-                "weight": 1.0
-            },
-            "目标达成": {
-                "keywords": ["目标达成", "完成业绩", "超额完成", "销售冠军", "top"],
-                "weight": 1.2
-            },
-            "市场推广": {
-                "keywords": ["市场推广", "校园活动", "讲座", "体验课", "地推"],
-                "weight": 0.9
-            },
-            "数据分析": {
-                "keywords": ["数据分析", "转化率", "销售数据", "报表", "分析"],
-                "weight": 0.8
-            }
-        }
-        
-        # 评估维度3：加分项
-        self.bonus_items = {
-            "考研经历": {
-                "keywords": ["考研", "研究生考试", "统考", "初试", "复试", "380", "400", "高分"],
-                "weight": 1.2,  # 考研顾问特别重要
-                "description": "有亲身考研经历，更容易理解学员"
-            },
-            "谈判技巧": {
-                "keywords": ["谈判", "议价", "价格谈判", "商务谈判", "沟通技巧"],
-                "weight": 0.8
-            },
-            "团队管理": {
-                "keywords": ["团队管理", "带领团队", "团队建设", "团队协作", "组长"],
-                "weight": 0.7
-            },
-            "抗压能力": {
-                "keywords": ["抗压", "压力", "高强度", "挑战", "连续工作", "加班"],
-                "weight": 0.9
-            },
-            "新东方文化认同": {
-                "keywords": ["新东方", "俞敏洪", "终身学习", "教育理念", "企业文化"],
-                "weight": 0.6
-            }
-        }
-        
-        # 权重配置
-        self.weights = {
-            "hard": 0.5,      # 硬性条件 50%
-            "core": 0.3,      # 核心能力 30%
-            "bonus": 0.2      # 加分项 20%
-        }
-    
-    def evaluate(self, resume_text):
-        """评估单份简历"""
-        resume_lower = resume_text.lower()
-        
-        # 1. 评估硬性条件
-        hard_results = {}
-        hard_score = 0
-        hard_max = 0
-        mandatory_missing = []
-        
-        for req_name, req_config in self.hard_requirements.items():
-            weight = req_config["weight"]
-            hard_max += weight
-            
-            # 检查匹配
-            matched_keywords = []
-            for keyword in req_config["keywords"]:
-                if keyword in resume_lower:
-                    matched_keywords.append(keyword)
-            
-            is_matched = len(matched_keywords) > 0
-            item_score = weight if is_matched else 0
-            
-            if is_matched:
-                hard_score += item_score
-            
-            hard_results[req_name] = {
-                "matched": is_matched,
-                "score": item_score,
-                "keywords": matched_keywords[:3],  # 只保留前3个
-                "mandatory": req_config.get("mandatory", False)
-            }
-            
-            if req_config.get("mandatory", False) and not is_matched:
-                mandatory_missing.append(req_name)
-        
-        hard_final = (hard_score / hard_max * 100) if hard_max > 0 else 0
-        
-        # 2. 评估核心能力
-        core_results = {}
-        core_score = 0
-        core_max = 0
-        
-        for comp_name, comp_config in self.core_competencies.items():
-            weight = comp_config["weight"]
-            core_max += weight
-            
-            # 计算匹配强度
-            match_count = 0
-            matched_keywords = []
-            for keyword in comp_config["keywords"]:
-                if keyword in resume_lower:
-                    match_count += 1
-                    matched_keywords.append(keyword)
-            
-            # 匹配强度：0-3个关键词 -> 0-100%分数
-            match_strength = min(match_count / 3, 1.0)  # 最多匹配3个就满分
-            item_score = weight * match_strength
-            core_score += item_score
-            
-            core_results[comp_name] = {
-                "match_strength": match_strength,
-                "score": item_score,
-                "keywords": matched_keywords[:3],
-                "match_count": match_count
-            }
-        
-        core_final = (core_score / core_max * 100) if core_max > 0 else 0
-        
-        # 3. 评估加分项
-        bonus_results = {}
-        bonus_score = 0
-        bonus_max = 0
-        
-        for bonus_name, bonus_config in self.bonus_items.items():
-            weight = bonus_config["weight"]
-            bonus_max += weight
-            
-            matched_keywords = []
-            for keyword in bonus_config["keywords"]:
-                if keyword in resume_lower:
-                    matched_keywords.append(keyword)
-            
-            is_matched = len(matched_keywords) > 0
-            item_score = weight if is_matched else 0
-            bonus_score += item_score
-            
-            bonus_results[bonus_name] = {
-                "matched": is_matched,
-                "score": item_score,
-                "keywords": matched_keywords[:2]
-            }
-        
-        bonus_final = (bonus_score / bonus_max * 100) if bonus_max > 0 else 0
-        
-        # 4. 计算总分
-        total_score = (
-            hard_final * self.weights["hard"] +
-            core_final * self.weights["core"] +
-            bonus_final * self.weights["bonus"]
-        )
-        
-        # 5. 严重惩罚：缺失必须项
-        if mandatory_missing:
-            total_score *= 0.3  # 缺失必须项，得分降至30%
-        
-        # 6. 匹配度质量分析
-        quality_indicators = {
-            "hard_match_rate": len([r for r in hard_results.values() if r["matched"]]) / len(hard_results),
-            "core_avg_strength": sum(r["match_strength"] for r in core_results.values()) / len(core_results) if core_results else 0,
-            "bonus_count": len([r for r in bonus_results.values() if r["matched"]]),
-            "total_keywords": sum(len(r["keywords"]) for r in hard_results.values()) +
-                             sum(len(r["keywords"]) for r in core_results.values()) +
-                             sum(len(r["keywords"]) for r in bonus_results.values())
-        }
-        
-        return {
-            "total_score": total_score,
-            "breakdown": {
-                "hard": {"score": hard_final, "results": hard_results},
-                "core": {"score": core_final, "results": core_results},
-                "bonus": {"score": bonus_final, "results": bonus_results}
-            },
-            "quality": quality_indicators,
-            "mandatory_missing": mandatory_missing,
-            "text_length": len(resume_text)
-        }
-    
-    def get_rating(self, score):
-        """根据分数获取评级"""
-        if score >= 85:
-            return "🟢 强烈推荐", "核心能力突出，高度匹配岗位要求"
-        elif score >= 70:
-            return "🟡 推荐面试", "符合基本要求，具备培养潜力"
-        elif score >= 60:
-            return "🟠 可考虑", "部分条件符合，但有明显短板"
-        else:
-            return "🔴 暂不考虑", "不符合基本要求"
-    
-    def generate_insights(self, evaluation_result):
-        """生成深度洞察"""
-        insights = []
-        breakdown = evaluation_result["breakdown"]
-        
-        # 硬性条件分析
-        hard_matched = [name for name, data in breakdown["hard"]["results"].items() if data["matched"]]
-        hard_missing = [name for name, data in breakdown["hard"]["results"].items() if not data["matched"]]
-        
-        if hard_matched:
-            insights.append(f"✅ 硬性条件满足: {len(hard_matched)}/{len(self.hard_requirements)}项")
-            if "硕士学历" in hard_matched:
-                insights.append("  • 具备硕士学历，符合基本门槛")
-            if "教育行业经验" in hard_matched:
-                insights.append("  • 有教育行业经验，可快速上手")
-        
-        if hard_missing:
-            insights.append(f"⚠️  缺失硬性条件: {', '.join(hard_missing)}")
-        
-        # 核心能力分析
-        top_core = sorted(
-            [(name, data) for name, data in breakdown["core"]["results"].items()],
-            key=lambda x: x[1]["match_strength"],
-            reverse=True
-        )[:3]
-        
-        if top_core:
-            insights.append("🎯 核心能力优势:")
-            for name, data in top_core:
-                if data["match_strength"] >= 0.5:
-                    insights.append(f"  • {name}: {data['match_strength']:.1%}")
-        
-        # 加分项分析
-        bonus_matched = [name for name, data in breakdown["bonus"]["results"].items() if data["matched"]]
-        if bonus_matched:
-            insights.append("✨ 加分项优势:")
-            for bonus in bonus_matched:
-                if bonus == "考研经历":
-                    insights.append("  • 有考研经历，易于理解学员痛点")
-                elif bonus == "谈判技巧":
-                    insights.append("  • 具备谈判技巧，利于提高转化率")
-        
-        return insights
+    # 构建提示词
+    prompt = f"""你是一位资深的招聘专家。请根据以下岗位要求，对候选人进行综合评估。
 
-# ================ 第三部分：批量处理器 ================
-class ResumeBatchProcessor:
-    """简历批量处理器"""
-    
-    def __init__(self, folder_path="resumes"):
-        self.folder_path = folder_path
-        self.evaluator = EducationalConsultantEvaluator()
-        self.extractor = TextExtractor()
-        self.results = []
-        
-        # 创建文件夹（如果不存在）
-        os.makedirs(folder_path, exist_ok=True)
-    
-    def scan_resumes(self):
-        """扫描简历文件夹"""
-        print(f"\n🔍 扫描文件夹: {self.folder_path}")
-        
-        if not os.path.exists(self.folder_path):
-            print(f"❌ 文件夹不存在: {self.folder_path}")
-            print(f"💡 请创建文件夹: mkdir {self.folder_path}")
-            return []
-        
-        # 支持的文件格式
-        supported_formats = ['.txt']
-        if PDF_SUPPORT:
-            supported_formats.append('.pdf')
-        if DOCX_SUPPORT:
-            supported_formats.extend(['.docx', '.doc'])
-        
-        # 收集文件
-        resume_files = []
-        for filename in os.listdir(self.folder_path):
-            filepath = os.path.join(self.folder_path, filename)
-            
-            if os.path.isfile(filepath):
-                ext = os.path.splitext(filename)[1].lower()
-                if ext in supported_formats:
-                    resume_files.append({
-                        "filename": filename,
-                        "filepath": filepath,
-                        "extension": ext
-                    })
-        
-        print(f"📁 找到 {len(resume_files)} 份简历文件")
-        return resume_files
-    
-    def process_single(self, file_info, show_details=False):
-        """处理单份简历"""
-        print(f"\n{'='*60}")
-        print(f"📄 处理: {file_info['filename']}")
-        print(f"{'='*60}")
-        
-        # 1. 提取文本
-        print("🔧 提取文本内容...")
-        resume_text = self.extractor.extract(file_info['filepath'])
-        
-        if not resume_text or len(resume_text.strip()) < 50:
-            print("❌ 提取失败或内容过短，跳过")
-            return None
-        
-        print(f"📊 文本长度: {len(resume_text)} 字符")
-        
-        # 2. AI评估
-        print("🤖 AI评估中...")
-        evaluation = self.evaluator.evaluate(resume_text)
-        
-        # 3. 获取评级
-        score = evaluation["total_score"]
-        rating, reason = self.evaluator.get_rating(score)
-        
-        # 4. 显示结果
-        print(f"\n🎯 匹配度: {score:.1f}/100")
-        print(f"🏆 评级: {rating}")
-        print(f"📝 理由: {reason}")
-        
-        if show_details:
-            # 显示详细匹配
-            print("\n📋 详细匹配:")
-            for category in ["hard", "core", "bonus"]:
-                category_data = evaluation["breakdown"][category]
-                print(f"\n  {category.upper()} 维度 ({category_data['score']:.1f}分):")
-                for item_name, item_data in category_data["results"].items():
-                    if category == "hard":
-                        status = "✅" if item_data["matched"] else "❌"
-                        print(f"    {status} {item_name}")
-                    elif category == "core":
-                        strength = item_data["match_strength"]
-                        bar = "█" * int(strength * 10) + "░" * (10 - int(strength * 10))
-                        print(f"    {bar} {strength:.1%} {item_name}")
-                    elif category == "bonus" and item_data["matched"]:
-                        print(f"    ✅ {item_name}")
-        
-        # 5. 显示关键洞察
-        insights = self.evaluator.generate_insights(evaluation)
-        if insights:
-            print("\n💡 关键洞察:")
-            for insight in insights[:5]:  # 只显示前5条
-                print(f"  {insight}")
-        
-        if evaluation["mandatory_missing"]:
-            print(f"\n⚠️  严重警告: 缺失必须项 {evaluation['mandatory_missing']}")
-        
-        # 6. 返回结果
-        result = {
-            "filename": file_info["filename"],
-            "filepath": file_info["filepath"],
-            "score": score,
-            "rating": rating,
-            "reason": reason,
-            "evaluation": evaluation,
-            "timestamp": datetime.now().isoformat()
-        }
-        
-        return result
-    
-    def process_all(self, max_files=None, show_details=False):
-        """处理所有简历"""
-        # 扫描文件
-        resume_files = self.scan_resumes()
-        
-        if not resume_files:
-            print("❌ 没有找到支持的简历文件")
-            print("💡 支持格式: .txt" + 
-                  (" + .pdf" if PDF_SUPPORT else "") + 
-                  (" + .docx" if DOCX_SUPPORT else ""))
-            return []
-        
-        if max_files:
-            resume_files = resume_files[:max_files]
-            print(f"\n⏱️  限制处理前 {max_files} 份简历")
-        
-        # 批量处理
-        print(f"\n🚀 开始批量处理 {len(resume_files)} 份简历...")
-        self.results = []
-        
-        for i, file_info in enumerate(resume_files, 1):
-            print(f"\n📦 进度: [{i}/{len(resume_files)}]")
-            
-            result = self.process_single(file_info, show_details)
-            if result:
-                self.results.append(result)
-        
-        print(f"\n✅ 处理完成: {len(self.results)}/{len(resume_files)} 份简历有效")
-        return self.results
-    
-    def generate_report(self, top_n=10):
-        """生成筛选报告"""
-        if not self.results:
-            return "❌ 没有处理结果"
-        
-        # 按分数排序
-        sorted_results = sorted(self.results, key=lambda x: x["score"], reverse=True)
-        
-        # 报告头部
-        report_lines = [
-            "=" * 70,
-            "                    📊 考研顾问简历筛选报告",
-            "=" * 70,
-            f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"处理总数: {len(self.results)} 份简历",
-            f"推荐阈值: ≥70分 (🟡推荐面试及以上)",
-            "=" * 70,
-            "",
-            f"🏆 TOP {min(top_n, len(sorted_results))} 候选人",
-            "=" * 70
-        ]
-        
-        # Top候选人
-        for i, result in enumerate(sorted_results[:top_n], 1):
-            report_lines.append(f"\n{i}. {result['filename']}")
-            report_lines.append(f"   匹配度: {result['score']:.1f}/100")
-            report_lines.append(f"   评级: {result['rating']}")
-            report_lines.append(f"   理由: {result['reason']}")
-            
-            # 关键匹配项
-            eval_data = result["evaluation"]
-            hard_matched = [name for name, data in eval_data["breakdown"]["hard"]["results"].items() 
-                          if data["matched"]]
-            if hard_matched:
-                report_lines.append(f"   硬性条件: {', '.join(hard_matched[:3])}")
-            
-            # 加分项
-            bonus_matched = [name for name, data in eval_data["breakdown"]["bonus"]["results"].items() 
-                           if data["matched"]]
-            if bonus_matched:
-                report_lines.append(f"   加分项: {', '.join(bonus_matched)}")
-            
-            if eval_data["mandatory_missing"]:
-                report_lines.append(f"   ⚠️ 缺失必须项: {', '.join(eval_data['mandatory_missing'])}")
-        
-        # 统计信息
-        report_lines.extend([
-            "\n" + "=" * 70,
-            "📈 统计信息",
-            "=" * 70
-        ])
-        
-        # 分数分布
-        score_ranges = [
-            ("优秀 (≥85)", lambda s: s >= 85),
-            ("良好 (70-84)", lambda s: 70 <= s < 85),
-            ("合格 (60-69)", lambda s: 60 <= s < 70),
-            ("不合格 (<60)", lambda s: s < 60)
-        ]
-        
-        for label, condition in score_ranges:
-            count = len([r for r in sorted_results if condition(r["score"])])
-            percentage = (count / len(sorted_results)) * 100
-            report_lines.append(f"{label}: {count}人 ({percentage:.1f}%)")
-        
-        # 关键技能统计
-        report_lines.extend([
-            "\n" + "=" * 70,
-            "🔧 候选人技能分析",
-            "=" * 70
-        ])
-        
-        # 统计硬性条件满足率
-        for req in ["硕士学历", "销售意识", "教育行业经验"]:
-            count = len([r for r in sorted_results 
-                        if r["evaluation"]["breakdown"]["hard"]["results"].get(req, {}).get("matched", False)])
-            percentage = (count / len(sorted_results)) * 100
-            report_lines.append(f"{req}: {count}人 ({percentage:.1f}%)")
-        
-        # 加分项统计
-        report_lines.append(f"\n✨ 加分项统计:")
-        for bonus in ["考研经历", "谈判技巧", "抗压能力"]:
-            count = len([r for r in sorted_results 
-                        if r["evaluation"]["breakdown"]["bonus"]["results"].get(bonus, {}).get("matched", False)])
-            if count > 0:
-                percentage = (count / len(sorted_results)) * 100
-                report_lines.append(f"  {bonus}: {count}人 ({percentage:.1f}%)")
-        
-        # 招聘建议
-        report_lines.extend([
-            "\n" + "=" * 70,
-            "💡 招聘建议",
-            "=" * 70
-        ])
-        
-        excellent_count = len([r for r in sorted_results if r["score"] >= 85])
-        good_count = len([r for r in sorted_results if 70 <= r["score"] < 85])
-        
-        if excellent_count >= 3:
-            report_lines.append("✅ 候选人质量优秀，建议:")
-            report_lines.append("  1. 优先面试Top 3-5名候选人")
-            report_lines.append("  2. 可适当提高筛选标准")
-            report_lines.append("  3. 重点关注匹配度≥85的候选人")
-        elif excellent_count >= 1 or good_count >= 3:
-            report_lines.append("🟡 候选人质量良好，建议:")
-            report_lines.append("  1. 面试匹配度≥70的候选人")
-            report_lines.append("  2. 重点考察硬性条件匹配情况")
-            report_lines.append("  3. 验证加分项的实际能力")
-        else:
-            report_lines.append("🔴 候选人质量一般，建议:")
-            report_lines.append("  1. 扩大招聘渠道获取更多简历")
-            report_lines.append("  2. 重新审视岗位要求的合理性")
-            report_lines.append("  3. 考虑放宽部分非核心要求")
-        
-        report_lines.append("\n" + "=" * 70)
-        
-        return "\n".join(report_lines)
-    
-    def save_results(self, output_dir="output"):
-        """保存结果到文件"""
-        os.makedirs(output_dir, exist_ok=True)
-        
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # 1. 保存详细结果（JSON）
-        json_file = os.path.join(output_dir, f"results_{timestamp}.json")
-        output_data = {
-            "timestamp": datetime.now().isoformat(),
-            "total_processed": len(self.results),
-            "results": self.results
-        }
-        
-        with open(json_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, ensure_ascii=False, indent=2)
-        
-        # 2. 保存报告（TXT）
-        report_file = os.path.join(output_dir, f"report_{timestamp}.txt")
-        report = self.generate_report()
-        
-        with open(report_file, 'w', encoding='utf-8') as f:
-            f.write(report)
-        
-        # 3. 保存Top候选人简表（CSV）
-        csv_file = os.path.join(output_dir, f"top_candidates_{timestamp}.csv")
-        sorted_results = sorted(self.results, key=lambda x: x["score"], reverse=True)
-        
-        csv_lines = ["文件名,匹配度,评级,硬性条件,加分项,缺失项"]
-        for result in sorted_results[:10]:  # Top 10
-            filename = result["filename"]
-            score = result["score"]
-            rating = result["rating"].split(" ")[1]  # 只取中文部分
-            
-            # 硬性条件
-            hard_matched = [name for name, data in result["evaluation"]["breakdown"]["hard"]["results"].items() 
-                          if data["matched"]]
-            hard_str = "|".join(hard_matched[:3])
-            
-            # 加分项
-            bonus_matched = [name for name, data in result["evaluation"]["breakdown"]["bonus"]["results"].items() 
-                           if data["matched"]]
-            bonus_str = "|".join(bonus_matched)
-            
-            # 缺失项
-            missing = result["evaluation"]["mandatory_missing"]
-            missing_str = "|".join(missing) if missing else "无"
-            
-            csv_lines.append(f'{filename},{score:.1f},{rating},"{hard_str}","{bonus_str}","{missing_str}"')
-        
-        with open(csv_file, 'w', encoding='utf-8') as f:
-            f.write("\n".join(csv_lines))
-        
-        print(f"\n💾 结果已保存到 {output_dir}/ 文件夹:")
-        print(f"  📄 详细结果: {json_file}")
-        print(f"  📊 筛选报告: {report_file}")
-        print(f"  📋 Top候选人: {csv_file}")
-        
-        return json_file, report_file, csv_file
+岗位要求: {job_description}
 
-# ================ 第四部分：用户界面 ================
-def main():
-    """主程序"""
-    print("\n" + "="*70)
-    print("           🤖 新东方考研顾问AI简历批量筛选系统")
-    print("="*70)
-    print("\n📁 系统将自动扫描 'resumes' 文件夹")
-    print("💡 请确保已将要筛选的简历放入该文件夹")
+简历内容（摘要）:
+{resume_text[:1500]}
+
+请严格按照以下格式输出（不要有多余内容）:
+评分: [0-100的整数]
+评语: [2-3句话，概括候选人的匹配度和建议]
+"""
+    # 调用LLM
+    response = call_llm(prompt, temperature=0.3)
+    if response.startswith("[错误]"):
+        return response
     
-    # 检查文件夹
-    if not os.path.exists("resumes"):
-        print(f"\n❌ 未找到 'resumes' 文件夹")
-        print("\n请按以下步骤操作:")
-        print("1. 创建文件夹: mkdir resumes")
-        print("2. 将简历文件放入 resumes 文件夹")
-        print("3. 支持格式: .txt" + 
-              (" + .pdf" if PDF_SUPPORT else "") + 
-              (" + .docx" if DOCX_SUPPORT else ""))
-        
-        create = input("\n是否自动创建文件夹? (y/n): ").lower()
-        if create == 'y':
-            os.makedirs("resumes", exist_ok=True)
-            print("✅ 已创建 'resumes' 文件夹")
-            print("💡 请将简历文件放入该文件夹后重新运行程序")
-        return
+    # 提取评分和评语
+    score_match = re.search(r'评分[:：]\s*(\d+)', response)
+    score = int(score_match.group(1)) if score_match else "未提供"
+    comment_match = re.search(r'评语[:：]\s*(.+?)(?=\n|$)', response, re.DOTALL)
+    comment = comment_match.group(1).strip() if comment_match else "评语提取失败"
     
-    # 创建处理器
-    processor = ResumeBatchProcessor("resumes")
+    return f"📊 {filename}\n  评分: {score}\n  评语: {comment}"
+
+def call_llm(prompt: str, temperature: float = 0.3) -> str:
+    """调用 Ollama API"""
+    payload = {
+        "model": MODEL_NAME,
+        "prompt": prompt,
+        "stream": False,
+        "options": {"temperature": temperature}
+    }
+    try:
+        resp = requests.post(OLLAMA_API, json=payload, timeout=120)
+        if resp.status_code == 200:
+            return resp.json().get("response", "")
+        return f"[错误] API返回状态码 {resp.status_code}"
+    except requests.exceptions.ConnectionError:
+        return "[错误] 无法连接到 Ollama，请确认 Ollama 正在运行"
+    except requests.exceptions.Timeout:
+        return "[错误] 请求超时"
+    except Exception as e:
+        return f"[错误] {e}"
+
+def execute_tool(action: Dict) -> str:
+    """根据 action 字典执行对应的工具"""
+    tool_name = action.get("tool")
+    params = action.get("params", {})
     
-    # 菜单
-    while True:
-        print("\n" + "="*70)
-        print("📋 主菜单")
-        print("="*70)
-        print("1. 🚀 快速批量筛选（推荐）")
-        print("2. ⚙️  自定义批量筛选")
-        print("3. 📄 单份简历测试")
-        print("4. 📁 检查简历文件夹")
-        print("5. 📊 查看岗位要求")
-        print("6. 💾 保存上次结果")
-        print("7. ❌ 退出系统")
+    if tool_name == "list_resumes":
+        return tool_list_resumes()
+    elif tool_name == "read_resume":
+        return tool_read_resume(params.get("filename", ""))
+    elif tool_name == "evaluate_resume":
+        return tool_evaluate_resume(params.get("filename", ""), params.get("job_description", ""))
+    elif tool_name == "finish":
+        return params.get("final_answer", "任务已完成")
+    else:
+        return f"❌ 未知工具: {tool_name}"
+
+# ============ Agent 核心（ReAct循环） ============
+
+def agent_react(user_query: str) -> str:
+    """ReAct 循环主函数"""
+    print(f"\n👤 用户指令: {user_query}")
+    print("=" * 60)
+    
+    # 系统提示词：告诉 Agent 可用的工具和输出格式
+    sys_prompt = f"""你是一个智能HR助手，可以自主使用工具来完成用户的任务。
+
+可用的工具如下（每个工具以JSON格式调用）：
+{json.dumps(TOOLS, ensure_ascii=False, indent=2)}
+
+用户指令: {user_query}
+
+你的工作方式：
+1. 每一步，你需要决定下一步做什么。
+2. 输出必须是一个JSON对象，包含 "thought"（思考）和 "action"（行动）两个字段。
+3. "action" 必须包含 "tool"（工具名）和 "params"（参数对象）。
+4. 如果任务完成，调用工具 "finish"，参数 "final_answer" 为最终回复。
+5. 不要输出任何多余内容，只输出JSON。
+
+示例:
+{{"thought": "用户要求筛选简历，我先列出所有简历", "action": {{"tool": "list_resumes", "params": {{}}}}}}
+{{"thought": "现在我需要评估张三的简历", "action": {{"tool": "evaluate_resume", "params": {{"filename": "张三.pdf", "job_description": "需要Python和数据分析"}}}}}}
+{{"thought": "所有简历评估完毕，生成最终报告", "action": {{"tool": "finish", "params": {{"final_answer": "经过评估，推荐李四和王五"}}}}}}
+"""
+    
+    # 历史记录，用于提供上下文
+    history = sys_prompt
+    iteration = 0
+    final_answer = None
+    
+    while iteration < MAX_ITERATIONS:
+        iteration += 1
+        print(f"\n🔄 第 {iteration} 轮思考...")
         
-        choice = input("\n请选择 (1-7): ").strip()
+        # 调用 LLM 获取下一步行动
+        llm_input = f"{history}\n\n现在，输出你的下一步行动（JSON格式）："
+        response = call_llm(llm_input, temperature=0.2)
         
-        if choice == "1":
-            # 快速批量筛选
-            print("\n🚀 启动快速批量筛选模式...")
-            print("💡 将处理所有简历，显示简要结果")
-            
-            processor.process_all(show_details=False)
-            
-            if processor.results:
-                report = processor.generate_report(top_n=10)
-                print("\n" + report)
-                
-                save = input("\n是否保存结果? (y/n): ").lower()
-                if save == 'y':
-                    processor.save_results()
+        if response.startswith("[错误]"):
+            return f"❌ Agent 出错: {response}"
         
-        elif choice == "2":
-            # 自定义批量筛选
-            print("\n⚙️  自定义批量筛选设置")
-            
-            try:
-                max_files = input("最大处理文件数 (留空=全部): ").strip()
-                max_files = int(max_files) if max_files else None
-            except:
-                max_files = None
-            
-            details = input("显示详细匹配信息? (y/n, 默认=n): ").lower() == 'y'
-            
-            processor.process_all(max_files=max_files, show_details=details)
-            
-            if processor.results:
-                report = processor.generate_report()
-                print("\n" + report)
-                
-                save = input("\n是否保存结果? (y/n): ").lower()
-                if save == 'y':
-                    processor.save_results()
+        # 尝试解析 JSON
+        try:
+            # 有时模型会输出 markdown 代码块，尝试提取
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                response = json_match.group(0)
+            action_data = json.loads(response)
+        except json.JSONDecodeError as e:
+            # 如果解析失败，记录原始响应并让模型重试或退出
+            print(f"⚠️ JSON 解析失败，响应内容: {response[:200]}...")
+            history += f"\n\n你的输出不是有效的JSON，请修正。错误: {e}"
+            continue
         
-        elif choice == "3":
-            # 单份简历测试
-            print("\n📄 单份简历测试模式")
-            
-            # 显示可用的简历
-            resume_files = processor.scan_resumes()
-            if not resume_files:
-                continue
-            
-            print("\n可用的简历文件:")
-            for i, file_info in enumerate(resume_files, 1):
-                print(f"{i}. {file_info['filename']}")
-            
-            try:
-                selection = input("\n选择文件编号 (或输入文件名): ").strip()
-                
-                if selection.isdigit():
-                    idx = int(selection) - 1
-                    if 0 <= idx < len(resume_files):
-                        file_info = resume_files[idx]
-                    else:
-                        print("❌ 编号无效")
-                        continue
-                else:
-                    # 按文件名查找
-                    matching = [f for f in resume_files if selection in f["filename"]]
-                    if matching:
-                        file_info = matching[0]
-                    else:
-                        print("❌ 未找到文件")
-                        continue
-                
-                # 处理单份简历
-                processor.process_single(file_info, show_details=True)
-                
-            except Exception as e:
-                print(f"❌ 处理失败: {e}")
+        thought = action_data.get("thought", "无思考")
+        action = action_data.get("action", {})
+        tool_name = action.get("tool")
+        params = action.get("params", {})
         
-        elif choice == "4":
-            # 检查文件夹
-            print("\n📁 检查简历文件夹")
-            resume_files = processor.scan_resumes()
-            
-            if resume_files:
-                print("\n📋 文件列表:")
-                for file_info in resume_files:
-                    size_kb = os.path.getsize(file_info["filepath"]) / 1024
-                    print(f"  📄 {file_info['filename']} ({file_info['extension']}, {size_kb:.1f}KB)")
-            else:
-                print("❌ 文件夹为空或没有支持的格式")
+        print(f"💭 思考: {thought}")
+        print(f"🔧 行动: 调用 {tool_name}，参数: {params}")
         
-        elif choice == "5":
-            # 显示岗位要求
-            evaluator = EducationalConsultantEvaluator()
-            print("\n" + "="*70)
-            print("           📋 考研顾问岗位要求")
-            print("="*70)
-            print(f"\n💰 薪酬: {evaluator.jd['salary']}")
-            
-            print("\n📋 岗位职责:")
-            for i, resp in enumerate(evaluator.jd['responsibilities'], 1):
-                print(f"{i}. {resp}")
-            
-            print("\n🎯 任职要求:")
-            for i, req in enumerate(evaluator.jd['requirements'], 1):
-                print(f"{i}. {req}")
-            
-            print("\n🔍 AI评估维度:")
-            print("\n硬性条件 (必须满足):")
-            for req in evaluator.hard_requirements.keys():
-                print(f"  • {req}")
-            
-            print("\n核心能力:")
-            for comp in evaluator.core_competencies.keys():
-                print(f"  • {comp}")
-            
-            print("\n加分项:")
-            for bonus in evaluator.bonus_items.keys():
-                print(f"  • {bonus}")
+        # 执行工具
+        observation = execute_tool(action)
+        print(f"📊 观察: {observation[:150]}..." if len(observation) > 150 else f"📊 观察: {observation}")
         
-        elif choice == "6":
-            # 保存上次结果
-            if not processor.results:
-                print("❌ 没有可保存的结果，请先进行筛选")
-            else:
-                processor.save_results()
-        
-        elif choice == "7":
-            print("\n👋 感谢使用，再见！")
+        # 如果调用了 finish，结束循环
+        if tool_name == "finish":
+            final_answer = observation
             break
         
-        else:
-            print("❌ 无效选择")
+        # 将本次交互添加到历史中
+        history += f"\n\n用户指令: {user_query}\n你执行了工具 {tool_name}，结果是: {observation}"
         
-        input("\n按Enter键继续...")
+        # 检查是否已经收集了足够信息（简化：如果已经评估了所有简历，自动结束）
+        if tool_name == "evaluate_resume" and "评估完成" in observation:
+            # 可以添加逻辑判断是否所有简历已评估，但这里交给模型自己决定
+            pass
+    
+    # 如果循环结束还没有 finish，生成一个汇总
+    if final_answer is None:
+        # 让模型总结当前状态
+        prompt = f"{history}\n\n任务似乎未明确结束，请根据已有的观察结果，给出一个最终答案。"
+        final_answer = call_llm(prompt, temperature=0.2)
+        if final_answer.startswith("[错误]"):
+            final_answer = "Agent 运行超时或出错，请重试。"
+    
+    return final_answer
 
-# ================ 程序入口 ================
-if __name__ == "__main__":
-    # 显示欢迎信息
-    print("\n" + "="*70)
-    print("             🎯 新东方考研顾问招聘AI助手")
-    print("="*70)
-    print("系统特点:")
-    print("  • 🤖 专门针对考研顾问岗位定制AI模型")
-    print("  • 📁 自动扫描 resumes 文件夹")
-    print("  • 📊 多维度智能评估 + 自动排名")
-    print("  • 💾 一键生成详细筛选报告")
-    print("="*70)
+# ============ 交互入口 ============
+
+def main():
+    print("=" * 60)
+    print("  🤖  ReAct 简历筛选 Agent")
+    print("=" * 60)
+    print("\n这个 Agent 会自主思考、调用工具来帮你筛选简历。")
+    print("它会自动列出简历、读取内容、根据你的要求评估并给出推荐。")
+    print("你只需输入岗位要求，例如：")
+    print("  '筛选数据分析师，需要Python、SQL、Tableau'")
+    print("或直接输入 '帮我看看简历'")
+    print("输入 'exit' 退出\n")
     
-    # 检查依赖
-    if not PDF_SUPPORT or not DOCX_SUPPORT:
-        print("\n⚠️  依赖库检查:")
-        if not PDF_SUPPORT:
-            print("  • 未安装 PyPDF2，将无法处理PDF文件")
-            print("    安装命令: pip install PyPDF2")
-        if not DOCX_SUPPORT:
-            print("  • 未安装 python-docx，将无法处理Word文件")
-            print("    安装命令: pip install python-docx")
-        print("\n💡 当前仅支持 .txt 格式")
-        print("   如需处理其他格式，请先安装上述库")
-        print("-"*70)
-    
-    # 运行主程序
+    # 检查 Ollama
     try:
-        main()
-    except KeyboardInterrupt:
-        print("\n\n👋 用户中断，程序退出")
-    except Exception as e:
-        print(f"\n❌ 程序运行出错: {e}")
-        print("💡 请检查输入和文件格式")
+        test = requests.post(OLLAMA_API, json={"model": MODEL_NAME, "prompt": "ping", "stream": False}, timeout=5)
+        if test.status_code != 200:
+            print("⚠️ Ollama 未正常运行，请检查服务是否启动。")
+            return
+        print("✅ Ollama 连接正常\n")
+    except:
+        print("⚠️ 无法连接到 Ollama，请确认 Ollama 正在运行（右下角羊驼图标）。")
+        return
+    
+    while True:
+        user_input = input("👤 你: ").strip()
+        if not user_input:
+            continue
+        if user_input.lower() in ["exit", "quit", "q"]:
+            print("👋 再见！")
+            break
+        
+        # 运行 Agent
+        result = agent_react(user_input)
+        print("\n" + "=" * 60)
+        print("🤖 最终答案:")
+        print(result)
+        print("=" * 60 + "\n")
+
+if __name__ == "__main__":
+    main()
